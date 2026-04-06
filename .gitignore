@@ -1,0 +1,5 @@
+# environment files
+.env
+
+# html output files
+*.html
