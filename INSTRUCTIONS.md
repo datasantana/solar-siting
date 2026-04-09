@@ -155,11 +155,11 @@ Fully implemented. Reverse-geocodes parcel centroids via Mapbox v6 API, assigns 
 
 ---
 
-## Phase 4 — Physical & Environmental Suitability
+## Phase 4 — Physical & Environmental Suitability ✅
 
 ### File: `phase4_physical_suitability.ipynb`
 
-> **Status**: Not yet created.
+> **Status**: Created.
 
 ### Purpose
 Compute all parcel-level physical, environmental, and suitability attributes required as inputs to Phase 5 scoring and triage. Unit of analysis: **parcels** (from `developable_parcels_{slug}`).
@@ -594,6 +594,6 @@ Each report includes:
 - [x] Phase 2 created (`phase2_solar_siting.ipynb`) — REA exclusions + lot subtraction
 - [x] Phase 3 created (`phase3_lot_parcels.ipynb`) — lot recovery, land use, buildings, parcels
 - [x] Geocoding created (`geocoding_parcels.ipynb`) — Mapbox reverse-geocode + UIDs
-- [ ] Create `phase4_physical_suitability.ipynb` — per spec above
+- [x] Create `phase4_physical_suitability.ipynb` — per spec above
 - [ ] Create `phase5_scoring_ranking.ipynb` — per spec above
 - [ ] Run full pipeline for all target counties (PTB, OTT, OXF, BRC/SIM)

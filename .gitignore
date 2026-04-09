@@ -3,3 +3,44 @@
 
 # html output files
 *.html
+
+# data files
+*.csv
+*.json
+*.xlsx
+*.db
+*.tif
+*.tiff
+*.shp
+*.geojson
+*.kml
+*.kmz
+*.zip
+*.tar.gz
+*.7z
+*.hdf
+*.nc
+*.grib
+*.img
+*.hdr
+*.prj
+*.sld
+*.qml
+*.lyr
+*.qgs
+*.qgz
+*.gdb
+*.mdb
+*.sqlite
+*.gpkg
+*.sde
+*.fgdb
+*.mxd
+*.lyrx
+*.lyr
+*.aux.xml
+*.xml
+*.log
+*.bak
+*.tmp
+*.cache
