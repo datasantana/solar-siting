@@ -44,8 +44,7 @@
 | `environment` | `significant_ecological_area` | `geom` — includes PSW, ANSI |
 | `environment` | `nhs_area` | `geom` |
 | `environment` | `wildlife_activity_area` | `geom` |
-| `environment` | `cli` | `cli_class`, `geom` — Canadian Land Inventory |
-| `environment` | `flood_hazard` | `geom` |
+| `environment` | `cli` | `CLI_SYS`, `geom` — Canadian Land Inventory |
 
 ### Utility Functions (reuse in every notebook)
 ```python
@@ -155,225 +154,128 @@ Fully implemented. Reverse-geocodes parcel centroids via Mapbox v6 API, assigns 
 
 ---
 
-## Phase 4 — Physical & Environmental Suitability ✅
+## Phase 4 — Physical & Environmental Suitability 🔧
 
 ### File: `phase4_physical_suitability.ipynb`
 
-> **Status**: Created.
+> **Status**: Refactored — single-geometry architecture.
+
+### Architecture
+
+**Single geometry column**: `parcels_phase4_{slug}` carries only `buildable_geom`
+(one row per parcel, unioned from `developable_area_parcels_{slug}`). Steps that need
+the full parcel boundary join back to `developable_parcels_{slug}` in SQL. This avoids
+geopandas dual-geometry serialization issues.
+
+**Incremental enrichment**: `update_parcels_phase4()` uses SQL `ALTER TABLE` + `UPDATE`
+via a temp table — geometry columns are never touched by pandas.
 
 ### Purpose
-Compute all parcel-level physical, environmental, and suitability attributes required as inputs to Phase 5 scoring and triage. Unit of analysis: **parcels** (from `developable_parcels_{slug}`).
+Compute all parcel-level physical, environmental, and suitability attributes required as inputs to Phase 5 scoring and triage. Unit of analysis: **parcels** (from `developable_area_parcels_{slug}`).
 
 ### Input
-- `analysis.developable_parcels_{county_slug}` — Phase 3 output, one row per parcel
+- `analysis.developable_area_parcels_{county_slug}` — Phase 3 output: buildable geometry fragments (one or more per parcel)
+- `analysis.developable_parcels_{county_slug}` — Phase 3 output: full parcel boundaries (one per parcel, enriched by geocoding)
 
 ### Config
 ```python
 COUNTY_NAME       = "Ottawa"
-COUNTY_SLUG       = COUNTY_NAME.lower().replace(" ", "_")
 CONSERVATION_AUTH = "rvca"       # orca | rvca | utrca — must match Phase 2
-PG_CONN           = ...          # from environment
-CRS_ONTARIO       = 5321
-CRS_WGS84         = 4326
 DEM_PATH          = "..."        # path to DEM raster (GeoTIFF, EPSG:5321)
 PVOUT_PATH        = "..."        # path to PVout raster (GeoTIFF, EPSG:5321)
 ```
 
 ### Steps
 
-#### Step 0 — Configuration
-Set all config variables above. Verify raster paths exist before proceeding.
-
-#### Step 1 — Load Phase 3 Parcels
-```sql
-SELECT parcel_id, solar_parcel_uid, main_address,
-       buildable_geom, parcel_geom,
-       buildable_area_ac, grid_mw, feeder_voltage
-FROM analysis.developable_parcels_{county_slug}
-```
-Save working copy as `analysis.parcels_phase4_{slug}` (will be enriched step by step).
-
-#### Step 2 — Slope
-Compute mean slope (%) over **buildable_geom only** using Rasterio zonal statistics on DEM raster.
-- Clip DEM to each parcel's buildable geometry before computing mean
-- CRS: EPSG:5321 throughout
-- Store result as `slope_mean` (float, %)
-
-Save → update `analysis.parcels_phase4_{slug}`.
-
-#### Step 3 — PVout (Irradiance)
-Compute mean PVout (kWh/kWp/year) over **buildable_geom** using Rasterio zonal statistics on PVout raster.
-- Store result as `pvout_mean` (float)
-
-Save → update `analysis.parcels_phase4_{slug}`.
-
-#### Step 4 — Noise Receptors
-Count buildings within 1,000 m of **parcel_geom** (full parcel boundary, not buildable area only).
-```sql
-SELECT p.parcel_id,
-       COUNT(b.geom) AS noise_count_1km
-FROM analysis.parcels_phase4_{slug} p
-LEFT JOIN cadastre.buildings_{slug} b
-  ON ST_DWithin(p.parcel_geom, b.geom, 1000)   -- EPSG:5321, metres
-GROUP BY p.parcel_id
-```
-- Store NULLs as NULL (Phase 5 will treat null = 0 receptors = MAX score)
-- Store result as `noise_count_1km` (integer, nullable)
-
-Save → update `analysis.parcels_phase4_{slug}`.
-
-#### Step 5 — Compactness (Polsby-Popper)
-Compute Polsby-Popper ratio on **buildable_geom**:
+#### Step 1 — Create Phase 4 Working Table
+Union buildable fragments per parcel from `developable_area_parcels_{slug}`.
+Carry forward grid attributes. Compute `buildable_area_ac` from the unioned geometry.
+Scalar parcel metadata (address, UID) are NOT stored here — they live in `developable_parcels_{slug}`.
 ```sql
 SELECT parcel_id,
-       (4 * pi() * ST_Area(buildable_geom)) /
-       (ST_Perimeter(buildable_geom) * ST_Perimeter(buildable_geom)) AS pp_ratio
-FROM analysis.parcels_phase4_{slug}
+       ST_MakeValid(ST_Union(geom)) AS geom,   -- buildable_geom, EPSG:5321
+       ROUND((ST_Area(ST_Union(geom)) / 4046.856)::numeric, 3) AS buildable_area_ac,
+       ... grid_capacity_mw, voltage_3ph ...
+FROM analysis.developable_area_parcels_{slug}
+GROUP BY parcel_id
 ```
-- Store result as `pp_ratio` (float, 0–1; 1 = perfect circle)
+Save → `analysis.parcels_phase4_{slug}` (single geometry = `geom`, which IS the buildable area).
 
-Save → update `analysis.parcels_phase4_{slug}`.
+#### Step 2 — Slope
+Rasterio zonal stats on DEM raster over `geom` (buildable area). Store `slope_mean` (float, %).
 
-#### Step 6 — CA Authority Proximity
-Compute overlap ratio between **buildable_geom** and the CA regulated area for this county.
+#### Step 3 — PVout (Irradiance)
+Rasterio zonal stats on PVout raster over `geom` (buildable area). Store `pvout_mean` (float, kWh/kWp/yr).
+
+#### Step 4 — Noise Receptors
+Count buildings within 1 km of **full parcel boundary** — join to `developable_parcels_{slug}` in SQL:
 ```sql
-SELECT p.parcel_id,
-       COALESCE(
-         ST_Area(ST_Intersection(p.buildable_geom, ca.geom)) /
-         NULLIF(ST_Area(p.buildable_geom), 0),
-         0
-       ) AS ca_overlap_ratio
 FROM analysis.parcels_phase4_{slug} p
-LEFT JOIN rea.{CONSERVATION_AUTH}_regulated_area ca
-  ON ST_Intersects(p.buildable_geom, ca.geom)
+JOIN analysis.developable_parcels_{slug} dp ON dp.parcel_id = p.parcel_id
+LEFT JOIN cadastre.buildings_{slug} b
+  ON ST_DWithin(dp.geom, b.geom, 1000)   -- dp.geom = full parcel, EPSG:5321
 ```
-- Store result as `ca_overlap_ratio` (float, 0.0–1.0)
-- This feeds both the ECI Environmental Risk score (weight 3) and triage classification
+Store `noise_count_1km` (integer, nullable). NULL = no buildings table.
 
-Save → update `analysis.parcels_phase4_{slug}`.
+#### Step 5 — Compactness (Polsby-Popper)
+Compute on `geom` (buildable area) in EPSG:5321. Store `pp_ratio` (float, 0–1).
 
-#### Step 7 — Environmental Flags (ECI Inputs)
-Compute binary flags for each ECI input layer via spatial join to **parcel_geom** (full boundary, not buildable only). Each flag is 1 if the layer intersects the parcel, 0 otherwise.
+#### Step 6 — CA Authority Overlap
+Overlap ratio between `geom` (buildable) and CA regulated area. Store `ca_overlap_ratio` (float, 0–1).
 
-| Flag field | Source table | ECI weight |
-|---|---|---|
-| `flag_wetland` | `rea.wetland` | 3 |
-| `flag_woodland` | `rea.woodland` | 3 |
-| `flag_nhs` | `environment.nhs_area` | 2 |
-| `flag_saro_prox` | `environment.prov_trk_species` (any SARO species range) | 2 |
-| `flag_waa` | `environment.wildlife_activity_area` | 2 |
-| `flag_ca_regulated` | derived from `ca_overlap_ratio > 0` | 3 |
-| `flag_flood` | `environment.flood_hazard` | 3 |
-| `flag_cli` | `environment.cli` where `cli_class IN (1, 2)` | 1 |
-
-Store all flags as integer columns (0/1). Also store as `env_flags` JSON field for human-readable reporting.
-
-Compute `eci_raw`:
-```python
-eci_raw = (
-    flag_wetland * 3 +
-    flag_woodland * 3 +
-    flag_nhs * 2 +
-    flag_saro_prox * 2 +
-    flag_waa * 2 +
-    flag_ca_regulated * 3 +
-    flag_flood * 3 +
-    flag_cli * 1
-)  # max possible = 19
+#### Step 7 — Environmental Flags (ECI)
+7 binary flags via spatial join to **full parcel boundary** — join to `developable_parcels_{slug}`:
+```sql
+FROM analysis.parcels_phase4_{slug} p
+JOIN analysis.developable_parcels_{slug} dp ON dp.parcel_id = p.parcel_id
+JOIN rea.wetland w ON ST_Intersects(dp.geom, w.geom)
 ```
-
-Save → update `analysis.parcels_phase4_{slug}`.
+`flag_ca_regulated` derived from `ca_overlap_ratio > 0`. Compute `eci_raw` weighted sum (max 16).
 
 #### Step 8 — SARO Species Assessment
-For each parcel, identify all SARO-listed species whose range intersects **parcel_geom**. Deduplicate by species scientific name.
-
-```sql
-SELECT p.parcel_id,
-       s.species_name,
-       s.saro_status
-FROM analysis.parcels_phase4_{slug} p
-JOIN environment.prov_trk_species s
-  ON ST_Intersects(p.parcel_geom, s.geom)
-ORDER BY p.parcel_id, s.saro_status
-```
-
-Compute per parcel:
-- `end_present` (boolean): TRUE if any END species found
-- `end_species` (text[]): list of END species names
-- `thr_count` (integer): count of unique THR species
-- `sc_count` (integer): count of unique SC species
-- `saro_raw` (integer): THR_count × 2 + SC_count × 1 (END handled separately in Phase 5)
-
-Save → update `analysis.parcels_phase4_{slug}`.
+Same pattern — join to `developable_parcels_{slug}` for full parcel boundary.
+Store `end_present`, `end_species`, `thr_count`, `sc_count`, `saro_raw`.
 
 #### Step 9 — Triage Classification
-Apply traffic-light triage logic. Every parcel must receive a `triage_class` and structured `triage_flags` list.
-
-**RED** (no score assigned in Phase 5 — report only):
-- `end_present = TRUE`
-- PSW or ANSI intersects buildable_geom (`ST_Intersects`)
-- `ca_overlap_ratio >= 0.60`
-- `grid_mw > 0 AND (buildable_area_ac / 5.0) / grid_mw < 0.5` (grid capacity ratio < 0.5)
-- Active anti-solar municipal resolution on record AND municipal score = 0
-
-**AMBER** (scored + ranked, remediation note required):
-- `ca_overlap_ratio > 0 AND ca_overlap_ratio < 0.60`
-- THR or SC species present (thr_count > 0 OR sc_count > 0)
-- NHS overlaps buildable_geom
-- Mean slope > 8% on > 25% of buildable area
-- `noise_count_1km > 8`
-- Municipal score between 4 and 6 (inclusive)
-- `(buildable_area_ac / 5.0) / grid_mw BETWEEN 0.5 AND 0.7`
-- `noise_count_1km IS NULL` (data gap — flag for review)
-
-**GREEN**: all checks above are negative.
-
-Also compute:
-- `data_completeness`: `PROVINCIAL_ONLY` | `PROVINCIAL_COUNTY` | `FULL_THREE_TIER`
-  (based on which env tier data was available for this parcel's assessment)
-
-Save all triage outputs → update `analysis.parcels_phase4_{slug}`.
+RED / AMBER / GREEN logic. PSW/ANSI and NHS checks use `geom` (buildable area) directly.
+Store `triage_class`, `triage_flags`, `data_completeness`.
 
 #### Step 10 — Verification & Map
-- Summary table: count of GREEN / AMBER / RED per triage trigger
-- Folium map (EPSG:4326): parcels colored by triage_class, env flag overlay
-- Export → `map_phase4_{slug}.html`
+Join `parcels_phase4_{slug}` scalars to `developable_parcels_{slug}` geometry for map display.
+Folium map colored by `triage_class`. Export → `map_phase4_{slug}.html`.
 
 ### Output Table: `analysis.parcels_phase4_{slug}`
 
+Single geometry column (`geom` = buildable area in EPSG:5321). All scalar parcel
+metadata (address, UID, parcel_acre) remains in `developable_parcels_{slug}` and is
+joined at query time (Step 10, Phase 5).
+
 | Field | Type | Description |
 |---|---|---|
-| `parcel_id` | integer | Primary key |
-| `solar_parcel_uid` | text | UUID-5 from geocoding |
-| `main_address` | text | Reverse-geocoded address |
-| `buildable_geom` | geometry | Buildable area polygon (EPSG:5321) |
-| `parcel_geom` | geometry | Full parcel boundary (EPSG:5321) |
+| `parcel_id` | integer | Primary key (matches `developable_parcels_{slug}`) |
+| `geom` | geometry | Buildable area polygon (EPSG:5321) — unioned from fragments |
 | `buildable_area_ac` | float | Buildable area in acres |
 | `grid_mw` | float | Grid capacity at nearest feeder (MW) |
 | `feeder_voltage` | float | Feeder voltage (kV) |
 | `slope_mean` | float | Mean slope over buildable area (%) |
 | `pvout_mean` | float | Mean PVout over buildable area (kWh/kWp/yr) |
-| `noise_count_1km` | integer | Building count within 1 km (nullable) |
+| `noise_count_1km` | integer | Building count within 1 km of parcel boundary (nullable) |
 | `pp_ratio` | float | Polsby-Popper compactness ratio (0–1) |
 | `ca_overlap_ratio` | float | CA regulated area / buildable area (0–1) |
-| `flag_wetland` | integer | 0/1 |
-| `flag_woodland` | integer | 0/1 |
-| `flag_nhs` | integer | 0/1 |
-| `flag_saro_prox` | integer | 0/1 |
-| `flag_waa` | integer | 0/1 |
-| `flag_ca_regulated` | integer | 0/1 (derived from ca_overlap_ratio > 0) |
-| `flag_flood` | integer | 0/1 |
-| `flag_cli` | integer | 0/1 |
-| `env_flags` | jsonb | All flags as key-value JSON |
-| `eci_raw` | integer | Weighted sum of env flags (0–19) |
+| `flag_wetland` .. `flag_cli` | integer | 0/1 binary env flags |
+| `env_flags` | text | All flags as JSON |
+| `eci_raw` | integer | Weighted sum of env flags (0–16) |
 | `end_present` | boolean | TRUE if any END species in parcel |
-| `end_species` | text[] | List of END species names |
+| `end_species` | text | JSON list of END species names |
 | `thr_count` | integer | Unique THR species count |
 | `sc_count` | integer | Unique SC species count |
-| `saro_raw` | integer | THR×2 + SC×1 (END scored separately) |
+| `saro_raw` | integer | THR×2 + SC×1 |
 | `triage_class` | text | GREEN / AMBER / RED |
-| `triage_flags` | jsonb | List of triggered triage conditions |
+| `triage_flags` | text | JSON list of triggered conditions |
 | `data_completeness` | text | PROVINCIAL_ONLY / PROVINCIAL_COUNTY / FULL_THREE_TIER |
+
+> **Note**: `solar_parcel_uid`, `main_address`, `parcel_acre`, `parcel_geom` remain in
+> `developable_parcels_{slug}`. Join on `parcel_id` when needed.
 
 ---
 
@@ -413,7 +315,7 @@ VOLTAGE_BONUS_KV         = 27.6   # Ottawa: feeders at this voltage earn +5 pts
 | Irradiance | 5 | Min-max on `pvout_mean`, county range → 0–5 |
 | SARO | 15 | `base = 15 − saro_raw`, floor 0. If `end_present`: apply additional 5pt penalty (floor 0) and confirm `triage_class = RED` |
 | Noise Receptors | 10 | `noise_count_1km IS NULL OR noise_count_1km == 0` → 10 pts (MAX). Else: inverted min-max on `noise_count_1km`, county range → 0–10 |
-| Environmental Risk | 15 | `score = (1 − eci_raw / 19) × 15`, floor 0 |
+| Environmental Risk | 15 | `score = (1 − eci_raw / 16) × 15`, floor 0 |
 | Slope | 5 | `≤4% → 5` · `4–8% → linear 5→2` · `8–12% → 1` · `>12% → 0` |
 | Compactness | 5 | Min-max on `pp_ratio`, county range → 0–5 |
 | Municipal Politics | 5 | `muni_score = (muni_raw / 10) × 5` (from Laurent CSV) |
@@ -472,7 +374,7 @@ df.loc[others, "score_noise"] = (1 - (df.loc[others, "noise_count_1km"] - mn) / 
 
 #### Step 7 — Environmental Risk Score (ECI)
 ```python
-df["score_env"] = ((1 - df["eci_raw"] / 19) * 15).clip(lower=0)
+df["score_env"] = ((1 - df["eci_raw"] / 16) * 15).clip(lower=0)
 ```
 
 #### Step 8 — Slope Score
